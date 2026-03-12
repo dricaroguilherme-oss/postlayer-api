@@ -1,29 +1,31 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import httpx
 from fastapi import HTTPException, status
 
+from app.infra.config import get_settings
 
-def require_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"{name} is required")
-    return value.strip()
+settings = get_settings()
 
 
 def supabase_url() -> str:
-    return require_env("SUPABASE_URL").rstrip("/")
+    if not settings.supabase_url:
+        raise RuntimeError("SUPABASE_URL is required")
+    return settings.supabase_url.rstrip("/")
 
 
 def anon_key() -> str:
-    return require_env("SUPABASE_ANON_KEY")
+    if not settings.supabase_anon_key:
+        raise RuntimeError("SUPABASE_ANON_KEY is required")
+    return settings.supabase_anon_key
 
 
 def service_role_key() -> str:
-    return require_env("SUPABASE_SERVICE_ROLE_KEY")
+    if not settings.supabase_service_role_key:
+        raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is required")
+    return settings.supabase_service_role_key
 
 
 def request(
@@ -44,7 +46,7 @@ def request(
     if headers:
         merged_headers.update(headers)
 
-    response = httpx.request(
+    return httpx.request(
         method,
         f"{supabase_url()}{path}",
         params=params,
@@ -52,7 +54,6 @@ def request(
         headers=merged_headers,
         timeout=20.0,
     )
-    return response
 
 
 def require_ok(response: httpx.Response) -> Any:
@@ -61,7 +62,6 @@ def require_ok(response: httpx.Response) -> Any:
             return None
         return response.json()
 
-    detail = None
     try:
         payload = response.json()
         detail = payload.get("msg") or payload.get("message") or payload.get("error_description") or payload.get("error")
