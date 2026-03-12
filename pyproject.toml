@@ -1,0 +1,15 @@
+[project]
+name = "postlayer-api"
+version = "0.1.0"
+description = "Backend API for PostLayer"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.116.1",
+  "uvicorn[standard]>=0.35.0",
+  "pydantic>=2.11.7",
+  "PyJWT>=2.10.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
