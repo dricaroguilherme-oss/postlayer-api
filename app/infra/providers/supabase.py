@@ -13,19 +13,19 @@ settings = get_settings()
 def supabase_url() -> str:
     if not settings.supabase_url:
         raise RuntimeError("SUPABASE_URL is required")
-    return settings.supabase_url.rstrip("/")
+    return settings.supabase_url.strip().rstrip("/")
 
 
 def anon_key() -> str:
     if not settings.supabase_anon_key:
         raise RuntimeError("SUPABASE_ANON_KEY is required")
-    return settings.supabase_anon_key
+    return settings.supabase_anon_key.strip()
 
 
 def service_role_key() -> str:
     if not settings.supabase_service_role_key:
         raise RuntimeError("SUPABASE_SERVICE_ROLE_KEY is required")
-    return settings.supabase_service_role_key
+    return settings.supabase_service_role_key.strip()
 
 
 def request(
