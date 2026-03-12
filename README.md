@@ -40,7 +40,7 @@ with SessionLocal() as session:
 - `SUPABASE_URL` obrigatória
 - `SUPABASE_ANON_KEY` obrigatória
 - `SUPABASE_SERVICE_ROLE_KEY` obrigatória
-- `DATABASE_URL` obrigatória para o domínio ORM/migrations
+- `DATABASE_URL` obrigatória para o domínio ORM/migrations. Na Vercel use a URL do pooler do Supabase, não o host `db.<project-ref>.supabase.co`.
 - `OPENAI_API_KEY` opcional para provider remoto
 - `OPENAI_ENABLE_LIVE_CALLS` default `false` para manter fallback local determinístico
 - `POSTLAYER_ALLOWED_ORIGINS` default `http://localhost:3000,http://localhost:8080,http://localhost:5173`
