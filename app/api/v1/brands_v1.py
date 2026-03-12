@@ -51,3 +51,23 @@ def get_brand_v1(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
     get_membership(user["id"], str(brand.tenant_id))
     return BrandRead.model_validate(brand)
+
+
+@router.put("/{brand_id}", response_model=BrandRead)
+def update_brand_v1(
+    brand_id: UUID,
+    payload: BrandCreatePayload,
+    user: dict = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> BrandRead:
+    brand = session.get(Brand, brand_id)
+    if brand is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand not found")
+    get_membership(user["id"], str(brand.tenant_id))
+
+    for field, value in payload.model_dump().items():
+        setattr(brand, field, value)
+
+    session.commit()
+    session.refresh(brand)
+    return BrandRead.model_validate(brand)

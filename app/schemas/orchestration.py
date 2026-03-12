@@ -40,6 +40,10 @@ class PageEditPayload(APIModel):
     review_json: dict[str, Any] | None = None
 
 
+class ReorderProjectPagesPayload(APIModel):
+    page_ids: list[UUID] = Field(min_length=1)
+
+
 class WorkflowRunResponse(BaseModel):
     project_id: UUID
     version_id: UUID | None = None

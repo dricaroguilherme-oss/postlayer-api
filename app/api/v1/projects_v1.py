@@ -26,7 +26,12 @@ from app.schemas.creative import (
     ExportJobRead,
     ProjectVersionRead,
 )
-from app.schemas.orchestration import OrchestrateProjectPayload, PageEditPayload, WorkflowRunResponse
+from app.schemas.orchestration import (
+    OrchestrateProjectPayload,
+    PageEditPayload,
+    ReorderProjectPagesPayload,
+    WorkflowRunResponse,
+)
 
 router = APIRouter(prefix="/v1/projects", tags=["v1-projects"])
 
@@ -50,10 +55,68 @@ def _project_or_404(session: Session, project_id: UUID) -> CreativeProject:
     return project
 
 
+def _project_pages(session: Session, project_id: UUID) -> list[CreativePage]:
+    return list(
+        session.scalars(
+            select(CreativePage).where(CreativePage.project_id == project_id).order_by(CreativePage.page_index.asc())
+        )
+    )
+
+
+def _render_tree_from_pages(pages: list[CreativePage]) -> dict:
+    return {
+        "pages": [
+            {
+                "page_index": page.page_index,
+                "page_role": page.page_role,
+                **page.layout_json,
+            }
+            for page in pages
+        ]
+    }
+
+
+def _persist_user_version(
+    session: Session,
+    project: CreativeProject,
+    *,
+    source_type: str,
+    strategy_json: dict,
+    pages: list[CreativePage],
+) -> ProjectVersion:
+    version = ProjectVersion(
+        project_id=project.id,
+        version_number=next_project_version_number(session, project.id),
+        source_type=source_type,
+        strategy_json=strategy_json,
+        art_direction_json={},
+        render_tree_json=_render_tree_from_pages(pages),
+        exported_assets_json={},
+    )
+    session.add(version)
+    session.flush()
+    project.current_version_id = version.id
+    return version
+
+
+def _reindex_pages(session: Session, ordered_pages: list[CreativePage]) -> list[CreativePage]:
+    offset = len(ordered_pages) + 1
+    for index, page in enumerate(ordered_pages):
+        page.page_index = index + offset
+        if page.layout_json:
+            page.layout_json = {**page.layout_json, "page_index": index + offset}
+    session.flush()
+
+    for index, page in enumerate(ordered_pages):
+        page.page_index = index
+        if page.layout_json:
+            page.layout_json = {**page.layout_json, "page_index": index}
+    session.flush()
+    return ordered_pages
+
+
 def _serialize_project_bundle(session: Session, project: CreativeProject) -> CreativeProjectBundle:
-    pages = session.scalars(
-        select(CreativePage).where(CreativePage.project_id == project.id).order_by(CreativePage.page_index.asc())
-    ).all()
+    pages = _project_pages(session, project.id)
     versions = session.scalars(
         select(ProjectVersion).where(ProjectVersion.project_id == project.id).order_by(ProjectVersion.version_number.desc())
     ).all()
@@ -171,33 +234,87 @@ def apply_page_edit(
     if payload.review_json is not None:
         page.review_json = payload.review_json
 
-    pages = session.scalars(
-        select(CreativePage).where(CreativePage.project_id == project.id).order_by(CreativePage.page_index.asc())
-    ).all()
-    version = ProjectVersion(
-        project_id=project.id,
-        version_number=next_project_version_number(session, project.id),
+    pages = _project_pages(session, project.id)
+    version = _persist_user_version(
+        session,
+        project,
         source_type=ProjectVersionSourceType.USER_EDIT.value,
         strategy_json={"edited_page_id": str(page.id)},
-        art_direction_json={},
-        render_tree_json={
-            "pages": [
-                {
-                    "page_index": current_page.page_index,
-                    "page_role": current_page.page_role,
-                    **current_page.layout_json,
-                }
-                for current_page in pages
-            ]
-        },
-        exported_assets_json={},
+        pages=pages,
     )
-    session.add(version)
-    session.flush()
-    project.current_version_id = version.id
     session.commit()
     session.refresh(version)
     return ProjectVersionRead.model_validate(version)
+
+
+@router.post("/{project_id}/pages/{page_id}/duplicate", response_model=CreativeProjectBundle)
+def duplicate_project_page(
+    project_id: UUID,
+    page_id: UUID,
+    user: dict = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> CreativeProjectBundle:
+    project = _project_or_404(session, project_id)
+    get_membership(user["id"], str(project.tenant_id))
+    page = session.get(CreativePage, page_id)
+    if page is None or page.project_id != project.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
+
+    pages = _project_pages(session, project.id)
+    insert_index = page.page_index + 1
+    duplicated_page = CreativePage(
+        project_id=project.id,
+        page_index=insert_index,
+        page_role=page.page_role,
+        content_plan_json=dict(page.content_plan_json),
+        layout_json={**page.layout_json, "page_index": insert_index},
+        review_json=dict(page.review_json),
+    )
+    session.add(duplicated_page)
+    session.flush()
+    project.page_count += 1
+    pages = _project_pages(session, project.id)
+    pages.insert(insert_index, pages.pop(next(index for index, current_page in enumerate(pages) if current_page.id == duplicated_page.id)))
+    _reindex_pages(session, pages)
+    _persist_user_version(
+        session,
+        project,
+        source_type=ProjectVersionSourceType.USER_EDIT.value,
+        strategy_json={"duplicated_page_id": str(page.id)},
+        pages=pages,
+    )
+    session.commit()
+    session.refresh(project)
+    return _serialize_project_bundle(session, project)
+
+
+@router.post("/{project_id}/pages/reorder", response_model=CreativeProjectBundle)
+def reorder_project_pages(
+    project_id: UUID,
+    payload: ReorderProjectPagesPayload,
+    user: dict = Depends(get_current_user),
+    session: Session = Depends(get_session),
+) -> CreativeProjectBundle:
+    project = _project_or_404(session, project_id)
+    get_membership(user["id"], str(project.tenant_id))
+
+    pages = _project_pages(session, project.id)
+    pages_by_id = {page.id: page for page in pages}
+    if set(pages_by_id.keys()) != set(payload.page_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Page order must include all project pages")
+
+    reordered_pages = [pages_by_id[page_id] for page_id in payload.page_ids]
+    _reindex_pages(session, reordered_pages)
+    _persist_user_version(
+        session,
+        project,
+        source_type=ProjectVersionSourceType.USER_EDIT.value,
+        strategy_json={"reordered_page_ids": [str(page_id) for page_id in payload.page_ids]},
+        pages=reordered_pages,
+    )
+    session.commit()
+    session.refresh(project)
+    return _serialize_project_bundle(session, project)
 
 
 @router.post("/{project_id}/exports", response_model=ExportJobRead, status_code=status.HTTP_201_CREATED)
