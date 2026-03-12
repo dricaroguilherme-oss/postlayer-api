@@ -123,6 +123,7 @@ class ExportJob(UUIDPrimaryKeyMixin, Base):
     dimensions_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     dpi: Mapped[int] = mapped_column(Integer, default=144, nullable=False)
     output_url: Mapped[str | None] = mapped_column(Text)
+    output_manifest_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default=JobStatus.PENDING.value, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

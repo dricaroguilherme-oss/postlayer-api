@@ -241,12 +241,14 @@ class ArtDirectorAgent:
 
         def template_score(template: dict[str, Any]) -> tuple[int, int]:
             role = template.get("page_role")
+            preferred_template_id = project_context.get("preferred_template_id")
+            preferred_match = 10 if preferred_template_id and template.get("id") == preferred_template_id else 0
             is_system = 1 if template.get("is_system_template") else 0
             if project_context.get("piece_type") == "single_post":
                 preferred = 3 if role == "cover" else 1
             else:
                 preferred = 3 if role == "body" else 2 if role == "cover" else 1
-            return preferred, is_system
+            return preferred_match + preferred, is_system
 
         primary_template = max(templates, key=template_score) if templates else None
         reusable_assets = list(asset_context.get("assets", []))
@@ -732,6 +734,11 @@ class MemoryCuratorAgent:
                     "tags": ["generated", project_context["format_type"], project_context["channel"]],
                     "origin": "ai_generated",
                     "usage_context": [f"page_{index + 1}" for index in used_on_pages],
+                    "file_url": asset.get("file_url") or asset.get("preview_url"),
+                    "preview_url": asset.get("preview_url") or asset.get("file_url"),
+                    "dominant_color": asset.get("dominant_color"),
+                    "ai_generated": True,
+                    "is_decorative": asset.get("category") != "background",
                     "metadata_json": asset.get("metadata_json", {}),
                     "rationale": "Generated asset was used in the final layout and can become a reusable memory asset.",
                 }
@@ -739,6 +746,9 @@ class MemoryCuratorAgent:
 
         cta_pages = [page["page_index"] for page in pages if any(node["id"].startswith("cta-bg") for node in page.get("nodes", []))]
         if cta_pages:
+            cta_nodes = []
+            for page in pages:
+                cta_nodes.extend([node for node in page.get("nodes", []) if node["id"].startswith(("cta-bg", "cta-label"))])
             suggestions.append(
                 {
                     "name": "CTA Card",
@@ -746,6 +756,8 @@ class MemoryCuratorAgent:
                     "component_type": "cta_block",
                     "tags": ["cta", project_context["format_type"], "reusable"],
                     "usage_context": [f"page_{index + 1}" for index in cta_pages],
+                    "schema_json": {"nodes": cta_nodes},
+                    "style_json": {"variant": "accent-pill"},
                     "metadata_json": {"source": "layout_pattern"},
                     "rationale": "CTA block appears as a consistent callout and should be saved as a reusable design component.",
                 }
@@ -757,6 +769,9 @@ class MemoryCuratorAgent:
             if any(node["id"].startswith("slide-index") for node in page.get("nodes", []))
         ]
         if progression_pages:
+            progression_nodes = []
+            for page in pages:
+                progression_nodes.extend([node for node in page.get("nodes", []) if node["id"].startswith(("slide-index", "slide-index-bg"))])
             suggestions.append(
                 {
                     "name": "Carousel Progression Badge",
@@ -764,6 +779,8 @@ class MemoryCuratorAgent:
                     "component_type": "progression_badge",
                     "tags": ["carousel", "badge", "navigation"],
                     "usage_context": [f"page_{index + 1}" for index in progression_pages],
+                    "schema_json": {"nodes": progression_nodes},
+                    "style_json": {"variant": "accent-badge"},
                     "metadata_json": {"source": "layout_pattern"},
                     "rationale": "Progression badge repeats across carousel pages and should be promoted to reusable memory.",
                 }

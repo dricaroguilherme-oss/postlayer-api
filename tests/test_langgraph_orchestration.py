@@ -151,6 +151,7 @@ def test_graph_carousel_triggers_generation_autofix_and_export() -> None:
         for node in page["nodes"]
     )
     assert any(suggestion["category"] == "component" for suggestion in result["asset_suggestions"])
+    assert any(suggestion.get("schema_json") for suggestion in result["asset_suggestions"] if suggestion["category"] == "component")
     assert result["export_job_id"] == "1d636211-3f26-4b8c-b0b7-71dd874df0f9"
     assert any(entry["step"] == "export_final_assets" for entry in result["execution_log"])
 
@@ -203,3 +204,59 @@ def test_graph_reuses_existing_background_before_generating() -> None:
 
     assert result["art_direction_plan"]["asset_refs"] == ["asset-bg-1"]
     assert result["generated_assets"] == []
+
+
+def test_graph_prefers_project_selected_template() -> None:
+    service = _service()
+    result = service.graph.invoke(
+        {
+            "project_id": "1d2505d9-8e7b-44e4-a2a2-3f24141d2ef4",
+            "tenant_id": "078e523c-be43-45de-b8d8-4b0fb005459a",
+            "brand_id": None,
+            "ai_job_id": "877ec2ec-6a5b-40a3-bc94-8181f78fd638",
+            "project_context": {
+                "channel": "instagram",
+                "format_type": "instagram_post_square",
+                "piece_type": "single_post",
+                "page_count": 1,
+                "dimensions": {"width": 1080, "height": 1080},
+                "objective": "conversion",
+                "audience": "founders",
+                "language": "pt-BR",
+                "cta": "Teste agora",
+                "user_prompt": "Crie um post sobre automação criativa com foco em velocidade e branding.",
+                "preferred_template_id": "template-preferred",
+            },
+            "brand_context": {
+                "color_tokens": {
+                    "primary": ["#111827"],
+                    "secondary": ["#7C3AED"],
+                    "neutral": ["#F9FAFB"],
+                },
+                "typography": {"heading_family": "Space Grotesk", "body_family": "DM Sans"},
+                "visual_style_keywords": ["editorial", "high contrast"],
+            },
+            "asset_context": {"assets": []},
+            "template_context": {
+                "templates": [
+                    {
+                        "id": "template-generic",
+                        "format_type": "instagram_post_square",
+                        "page_role": "cover",
+                        "schema_json": {"regions": []},
+                    },
+                    {
+                        "id": "template-preferred",
+                        "format_type": "instagram_post_square",
+                        "page_role": "body",
+                        "schema_json": {"regions": []},
+                    },
+                ]
+            },
+            "generated_assets": [],
+            "execution_log": [],
+            "asset_suggestions": [],
+        }
+    )
+
+    assert result["art_direction_plan"]["template_id"] == "template-preferred"

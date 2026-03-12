@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import io
 import re
 import textwrap
-import urllib.parse
 from typing import Any
+
+from PIL import Image, ImageDraw
 
 from app.application.contracts.providers import ImageGenerationProvider, TextReasoningProvider
 
@@ -176,15 +179,25 @@ class LocalTextReasoningProvider(TextReasoningProvider):
             for asset in reusable_assets
             if asset.get("category") in {"texture", "graphic", "badge"}
         ][:2]
+        preferred_template_id = project_context.get("preferred_template_id")
         matching_template = next(
             (
                 template
                 for template in templates
-                if template.get("format_type") == project_context["format_type"]
-                and template.get("page_role") in {"cover", "body"}
+                if preferred_template_id and template.get("id") == preferred_template_id
             ),
             None,
         )
+        if matching_template is None:
+            matching_template = next(
+                (
+                    template
+                    for template in templates
+                    if template.get("format_type") == project_context["format_type"]
+                    and template.get("page_role") in {"cover", "body"}
+                ),
+                None,
+            )
         heading_family = typography.get("heading_family") or typography.get("family") or "Space Grotesk"
         objective = str(project_context.get("objective", "")).lower()
         piece_type = str(project_context.get("piece_type", "single_post"))
@@ -269,36 +282,104 @@ class LocalImageGenerationProvider(ImageGenerationProvider):
         secondary = (tone + 48) % 360
         tertiary = (tone + 112) % 360
 
-        if category == "graphic":
-            svg = f"""
-            <svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>
-              <rect width='100%' height='100%' fill='transparent' />
-              <path d='M {width * 0.14} {height * 0.78} C {width * 0.22} {height * 0.26}, {width * 0.62} {height * 0.26}, {width * 0.84} {height * 0.72}' fill='none' stroke='hsl({tone},72%,58%)' stroke-width='{max(width, height) * 0.028}' stroke-linecap='round' />
-              <circle cx='{width * 0.72}' cy='{height * 0.24}' r='{max(width, height) * 0.08}' fill='hsl({secondary},74%,55%)' opacity='0.92' />
-              <circle cx='{width * 0.24}' cy='{height * 0.36}' r='{max(width, height) * 0.05}' fill='hsl({tertiary},70%,64%)' opacity='0.8' />
-            </svg>
-            """.strip()
-        else:
-            svg = f"""
-            <svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>
-              <defs>
-                <linearGradient id='bg' x1='0%' y1='0%' x2='100%' y2='100%'>
-                  <stop offset='0%' stop-color='hsl({tone}, 70%, 58%)' />
-                  <stop offset='100%' stop-color='hsl({secondary}, 72%, 42%)' />
-                </linearGradient>
-                <radialGradient id='orb' cx='50%' cy='50%' r='50%'>
-                  <stop offset='0%' stop-color='rgba(255,255,255,0.45)' />
-                  <stop offset='100%' stop-color='rgba(255,255,255,0)' />
-                </radialGradient>
-              </defs>
-              <rect width='100%' height='100%' fill='url(#bg)' />
-              <circle cx='{width * 0.24}' cy='{height * 0.18}' r='{max(width, height) * 0.12}' fill='url(#orb)' />
-              <circle cx='{width * 0.76}' cy='{height * 0.72}' r='{max(width, height) * 0.18}' fill='rgba(0,0,0,0.16)' />
-              <path d='M {width * 0.1} {height * 0.92} L {width * 0.42} {height * 0.6} L {width * 0.7} {height * 0.76} L {width * 0.92} {height * 0.26}' stroke='rgba(255,255,255,0.18)' stroke-width='{max(width, height) * 0.018}' fill='none' />
-            </svg>
-            """.strip()
+        image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image, "RGBA")
+        base_hue = tone / 360
+        accent_hue = secondary / 360
+        tertiary_hue = tertiary / 360
 
-        data_url = "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
+        def to_rgba(hue: float, saturation: float, lightness: float, alpha: float = 1) -> tuple[int, int, int, int]:
+            import colorsys
+
+            red, green, blue = colorsys.hls_to_rgb(hue, lightness, saturation)
+            return (int(red * 255), int(green * 255), int(blue * 255), int(alpha * 255))
+
+        if category == "graphic":
+            draw.ellipse(
+                (
+                    width * 0.62,
+                    height * 0.14,
+                    width * 0.82,
+                    height * 0.34,
+                ),
+                fill=to_rgba(accent_hue, 0.74, 0.55, 0.92),
+            )
+            draw.ellipse(
+                (
+                    width * 0.18,
+                    height * 0.30,
+                    width * 0.30,
+                    height * 0.42,
+                ),
+                fill=to_rgba(tertiary_hue, 0.7, 0.64, 0.8),
+            )
+            draw.line(
+                (
+                    width * 0.14,
+                    height * 0.78,
+                    width * 0.30,
+                    height * 0.30,
+                    width * 0.62,
+                    height * 0.30,
+                    width * 0.84,
+                    height * 0.72,
+                ),
+                fill=to_rgba(base_hue, 0.72, 0.58),
+                width=max(4, int(max(width, height) * 0.028)),
+            )
+        else:
+            top_color = to_rgba(base_hue, 0.7, 0.58)
+            bottom_color = to_rgba(accent_hue, 0.72, 0.42)
+            gradient = Image.new("RGBA", (width, height))
+            gradient_pixels = gradient.load()
+            for y in range(height):
+                ratio = y / max(height - 1, 1)
+                for x in range(width):
+                    mix = min(1, max(0, (x / max(width - 1, 1) + ratio) / 2))
+                    gradient_pixels[x, y] = (
+                        int(top_color[0] + (bottom_color[0] - top_color[0]) * mix),
+                        int(top_color[1] + (bottom_color[1] - top_color[1]) * mix),
+                        int(top_color[2] + (bottom_color[2] - top_color[2]) * mix),
+                        255,
+                    )
+            image.alpha_composite(gradient)
+            draw = ImageDraw.Draw(image, "RGBA")
+            draw.ellipse(
+                (
+                    width * 0.12,
+                    height * 0.06,
+                    width * 0.36,
+                    height * 0.30,
+                ),
+                fill=(255, 255, 255, 105),
+            )
+            draw.ellipse(
+                (
+                    width * 0.58,
+                    height * 0.54,
+                    width * 0.94,
+                    height * 0.90,
+                ),
+                fill=(12, 18, 28, 42),
+            )
+            draw.line(
+                (
+                    width * 0.1,
+                    height * 0.92,
+                    width * 0.42,
+                    height * 0.6,
+                    width * 0.7,
+                    height * 0.76,
+                    width * 0.92,
+                    height * 0.26,
+                ),
+                fill=(255, 255, 255, 48),
+                width=max(3, int(max(width, height) * 0.018)),
+            )
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
         return {
             "name": _clip_text(prompt, 42),
             "category": category,

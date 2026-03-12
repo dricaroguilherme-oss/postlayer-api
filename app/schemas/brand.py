@@ -88,6 +88,10 @@ class DesignComponentRead(ORMModel):
     updated_at: datetime
 
 
+class DesignComponentListResponse(BaseModel):
+    items: list[DesignComponentRead] = Field(default_factory=list)
+
+
 class BrandCreatePayload(BaseModel):
     name: str
     primary_colors: list[str] = Field(default_factory=list)

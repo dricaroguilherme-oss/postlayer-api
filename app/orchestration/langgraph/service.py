@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import uuid
 from typing import Any, TypedDict
 
@@ -13,6 +14,7 @@ from app.domain.brand.models import Brand, BrandAsset
 from app.domain.common.types import JobStatus, ProjectStatus, ProjectVersionSourceType
 from app.domain.creative.models import AIJob, CreativePage, CreativeProject, ExportJob, ProjectVersion
 from app.domain.template.models import LayoutTemplate
+from app.export_engine.manifest import build_export_manifest
 from app.export_engine.service import ExportEngine
 from app.infra.providers.local_ai import LocalImageGenerationProvider, LocalTextReasoningProvider
 from app.infra.providers.openai_ai import OpenAIImageGenerationProvider, OpenAITextReasoningProvider
@@ -218,7 +220,10 @@ class LangGraphOrchestrationService:
             strategy_json=state.get("content_plan") or {},
             art_direction_json=state.get("art_direction_plan") or {},
             render_tree_json=state.get("composition_result") or {},
-            exported_assets_json={"generated_assets": state.get("generated_assets", [])},
+            exported_assets_json={
+                "generated_assets": state.get("generated_assets", []),
+                "asset_suggestions": state.get("asset_suggestions", []),
+            },
         )
         self.session.add(version)
         self.session.flush()
@@ -255,6 +260,7 @@ class LangGraphOrchestrationService:
                 "content_plan": state.get("content_plan"),
                 "art_direction_plan": state.get("art_direction_plan"),
                 "review_result": state.get("review_result"),
+                "asset_suggestions": state.get("asset_suggestions", []),
                 "version_id": str(version.id),
             }
             ai_job.status = JobStatus.COMPLETED.value
@@ -282,19 +288,46 @@ class LangGraphOrchestrationService:
             {
                 "pages": state["composition_result"]["pages"],
                 "file_type": export_context["file_type"],
+                "dpi": export_context.get("dpi", 144),
             }
+        )
+        page_indices = [page["page_index"] for page in export_result["pages"]]
+        export_job_id = uuid.uuid4()
+        manifest = build_export_manifest(
+            base_url=export_context.get("public_base_url", ""),
+            project_id=uuid.UUID(state["project_id"]),
+            export_job_id=export_job_id,
+            page_indices=page_indices,
+            file_type=export_context["file_type"],
         )
 
         export_job = ExportJob(
+            id=export_job_id,
             project_id=uuid.UUID(state["project_id"]),
             version_id=uuid.UUID(state["version_id"]),
             file_type=export_context["file_type"],
             dimensions_json=state["project_context"]["dimensions"],
             dpi=export_context.get("dpi", 144),
-            output_url=export_result["pages"][0]["data_url"] if export_result["pages"] else None,
+            output_url=manifest["batch_output_url"],
+            output_manifest_json=manifest,
             status=JobStatus.COMPLETED.value,
+            completed_at=datetime.now(timezone.utc),
         )
         self.session.add(export_job)
+        project = self.session.get(CreativeProject, uuid.UUID(state["project_id"]))
+        if project is not None:
+            project.status = ProjectStatus.EXPORTED.value
+        version = self.session.get(ProjectVersion, uuid.UUID(state["version_id"]))
+        if version is not None:
+            version.exported_assets_json = {
+                **(version.exported_assets_json or {}),
+                "latest_export": {
+                    "export_job_id": str(export_job.id),
+                    "file_type": export_job.file_type,
+                    "output_url": export_job.output_url,
+                    "output_manifest_json": manifest,
+                },
+            }
         self.session.commit()
 
         execution_log = list(state.get("execution_log", []))
@@ -303,7 +336,8 @@ class LangGraphOrchestrationService:
             "export_job_id": str(export_job.id),
             "export_context": {
                 **export_context,
-                "pages": export_result["pages"],
+                "pages": manifest["pages"],
+                "batch_output_url": manifest["batch_output_url"],
             },
             "execution_log": execution_log,
         }
@@ -408,6 +442,12 @@ class LangGraphOrchestrationService:
 
     def _build_project_context(self, project: CreativeProject) -> dict[str, Any]:
         project_schema = CreativeProjectRead.model_validate(project).model_dump(mode="json")
+        preferred_template_id = None
+        first_page = self.session.scalars(
+            select(CreativePage).where(CreativePage.project_id == project.id).order_by(CreativePage.page_index.asc()).limit(1)
+        ).first()
+        if first_page and isinstance(first_page.layout_json, dict):
+            preferred_template_id = first_page.layout_json.get("template_id")
         return {
             "channel": project_schema["channel"],
             "format_type": project_schema["format_type"],
@@ -419,6 +459,7 @@ class LangGraphOrchestrationService:
             "language": project_schema["language"],
             "cta": project_schema["cta"],
             "user_prompt": project_schema["user_prompt"],
+            "preferred_template_id": preferred_template_id,
         }
 
     def _build_brand_context(self, brand: Brand | None) -> dict[str, Any]:

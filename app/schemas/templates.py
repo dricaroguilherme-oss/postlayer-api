@@ -38,3 +38,14 @@ class LayoutTemplateRead(ORMModel):
 
 class LayoutTemplateListResponse(BaseModel):
     items: list[LayoutTemplateRead] = Field(default_factory=list)
+
+
+class SaveProjectTemplatePayload(APIModel):
+    name: str
+    page_id: UUID | None = None
+    brand_id: UUID | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class ApplyProjectTemplatePayload(APIModel):
+    page_id: UUID | None = None

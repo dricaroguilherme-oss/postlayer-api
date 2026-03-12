@@ -8,6 +8,7 @@ from app.api.v1 import (
     auth,
     brand,
     brands_v1,
+    components_v1,
     creative,
     organizations,
     presets,
@@ -28,5 +29,6 @@ api_router.include_router(ai.router)
 api_router.include_router(presets.router)
 api_router.include_router(brands_v1.router)
 api_router.include_router(assets_v1.router)
+api_router.include_router(components_v1.router)
 api_router.include_router(templates_v1.router)
 api_router.include_router(projects_v1.router)

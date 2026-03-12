@@ -197,6 +197,7 @@ class ExportJobRead(ORMModel):
     dimensions_json: dict[str, Any]
     dpi: int
     output_url: str | None = None
+    output_manifest_json: dict[str, Any] = Field(default_factory=dict)
     status: str
     created_at: datetime
     completed_at: datetime | None = None
