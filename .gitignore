@@ -5,3 +5,5 @@ dist/
 build/
 postlayer.db
 .env
+.vercel
+*.egg-info/

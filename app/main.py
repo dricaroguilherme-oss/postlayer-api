@@ -1,36 +1,34 @@
 from __future__ import annotations
 
+import os
 import re
 import uuid
+import urllib.parse
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.db import get_cursor, init_db, utcnow
-from app.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.supabase import content_range_total, request as supabase_request, require_ok
+
+
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("POSTLAYER_ALLOWED_ORIGINS", "http://localhost:8080,http://localhost:5173").split(",")
+    if origin.strip()
+]
+allow_all_origins = allowed_origins == ["*"]
 
 
 app = FastAPI(title="PostLayer API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in __import__("os").getenv(
-            "POSTLAYER_ALLOWED_ORIGINS", "http://localhost:8080,http://localhost:5173"
-        ).split(",")
-        if origin.strip()
-    ],
-    allow_credentials=True,
+    allow_origins=["*"] if allow_all_origins else allowed_origins,
+    allow_credentials=not allow_all_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
 
 
 class RegisterPayload(BaseModel):
@@ -84,35 +82,43 @@ def get_token(authorization: str | None = Header(default=None)) -> str:
 
 
 def get_current_user(token: str = Depends(get_token)) -> dict[str, Any]:
-    try:
-        user_id = decode_access_token(token)
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
-
-    with get_cursor() as cur:
-        user = cur.execute(
-            "SELECT id, email, full_name, created_at, updated_at FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-    return user
+    response = supabase_request("GET", "/auth/v1/user", use_service_role=False, access_token=token)
+    payload = require_ok(response)
+    metadata = payload.get("user_metadata") or {}
+    return {
+        "id": payload["id"],
+        "email": payload["email"],
+        "full_name": metadata.get("full_name"),
+        "created_at": payload["created_at"],
+        "updated_at": payload.get("updated_at") or payload["created_at"],
+        "access_token": token,
+    }
 
 
 def get_membership(user_id: str, organization_id: str) -> dict[str, Any]:
-    with get_cursor() as cur:
-        membership = cur.execute(
-            """
-            SELECT om.id, om.role, o.id AS organization_id, o.name, o.slug, o.logo_url
-            FROM organization_members om
-            JOIN organizations o ON o.id = om.organization_id
-            WHERE om.user_id = ? AND om.organization_id = ?
-            """,
-            (user_id, organization_id),
-        ).fetchone()
-    if not membership:
+    response = supabase_request(
+        "GET",
+        "/rest/v1/organization_members",
+        params={
+            "select": "id,role,organizations(id,name,slug,logo_url)",
+            "user_id": f"eq.{user_id}",
+            "organization_id": f"eq.{organization_id}",
+            "limit": "1",
+        },
+    )
+    rows = require_ok(response)
+    if not rows:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this organization")
-    return membership
+    membership = rows[0]
+    org = membership.get("organizations") or {}
+    return {
+        "id": membership["id"],
+        "role": membership["role"],
+        "organization_id": org.get("id", organization_id),
+        "name": org.get("name"),
+        "slug": org.get("slug"),
+        "logo_url": org.get("logo_url"),
+    }
 
 
 def slugify(value: str) -> str:
@@ -120,9 +126,19 @@ def slugify(value: str) -> str:
     return base or f"org-{uuid.uuid4().hex[:8]}"
 
 
-def auth_response(user: dict[str, Any]) -> dict[str, Any]:
-    token = create_access_token(user["id"])
-    return {"access_token": token, "user": user}
+def auth_response(payload: dict[str, Any]) -> dict[str, Any]:
+    user = payload["user"]
+    metadata = user.get("user_metadata") or {}
+    return {
+        "access_token": payload["access_token"],
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": metadata.get("full_name"),
+            "created_at": user["created_at"],
+            "updated_at": user.get("updated_at") or user["created_at"],
+        },
+    }
 
 
 @app.get("/api/health")
@@ -132,116 +148,126 @@ def healthcheck() -> dict[str, str]:
 
 @app.post("/api/auth/register")
 def register(payload: RegisterPayload) -> dict[str, Any]:
-    now = utcnow()
-    user_id = str(uuid.uuid4())
-    try:
-        with get_cursor(commit=True) as cur:
-            cur.execute(
-                """
-                INSERT INTO users (id, email, password_hash, full_name, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (user_id, payload.email.lower(), hash_password(payload.password), payload.full_name, now, now),
-            )
-    except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered") from exc
-
-    user = {"id": user_id, "email": payload.email.lower(), "full_name": payload.full_name, "created_at": now, "updated_at": now}
-    return auth_response(user)
+    create_response = supabase_request(
+        "POST",
+        "/auth/v1/admin/users",
+        json={
+            "email": payload.email.lower(),
+            "password": payload.password,
+            "email_confirm": True,
+            "user_metadata": {"full_name": payload.full_name},
+        },
+    )
+    require_ok(create_response)
+    return login(LoginPayload(email=payload.email, password=payload.password))
 
 
 @app.post("/api/auth/login")
 def login(payload: LoginPayload) -> dict[str, Any]:
-    with get_cursor() as cur:
-        user = cur.execute("SELECT * FROM users WHERE email = ?", (payload.email.lower(),)).fetchone()
-    if not user or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-
-    return auth_response(
-        {
-            "id": user["id"],
-            "email": user["email"],
-            "full_name": user["full_name"],
-            "created_at": user["created_at"],
-            "updated_at": user["updated_at"],
-        }
+    response = supabase_request(
+        "POST",
+        "/auth/v1/token",
+        use_service_role=False,
+        params={"grant_type": "password"},
+        json={"email": payload.email.lower(), "password": payload.password},
     )
+    payload_data = require_ok(response)
+    return auth_response(payload_data)
 
 
 @app.get("/api/auth/me")
 def me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    return user
+    return {k: user[k] for k in ("id", "email", "full_name", "created_at", "updated_at")}
 
 
 @app.get("/api/organizations")
 def list_organizations(user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
-    with get_cursor() as cur:
-        rows = cur.execute(
-            """
-            SELECT o.id, o.name, o.slug, o.logo_url, om.role
-            FROM organization_members om
-            JOIN organizations o ON o.id = om.organization_id
-            WHERE om.user_id = ?
-            ORDER BY o.created_at ASC
-            """,
-            (user["id"],),
-        ).fetchall()
-    return rows
+    response = supabase_request(
+        "GET",
+        "/rest/v1/organization_members",
+        params={
+            "select": "role,organizations(id,name,slug,logo_url)",
+            "user_id": f"eq.{user['id']}",
+            "order": "created_at.asc",
+        },
+    )
+    rows = require_ok(response)
+    organizations = []
+    for row in rows:
+        org = row.get("organizations")
+        if not org:
+            continue
+        organizations.append({**org, "role": row["role"]})
+    return organizations
 
 
 @app.post("/api/organizations", status_code=status.HTTP_201_CREATED)
 def create_organization(payload: OrganizationPayload, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    now = utcnow()
     org_id = str(uuid.uuid4())
     member_id = str(uuid.uuid4())
     brand_id = str(uuid.uuid4())
     slug = slugify(payload.name)
+    existing_response = supabase_request(
+        "GET",
+        "/rest/v1/organizations",
+        params={"select": "id", "slug": f"eq.{slug}", "limit": "1"},
+    )
+    if require_ok(existing_response):
+        slug = f"{slug}-{uuid.uuid4().hex[:6]}"
 
-    with get_cursor(commit=True) as cur:
-        existing = cur.execute("SELECT id FROM organizations WHERE slug = ?", (slug,)).fetchone()
-        if existing:
-            slug = f"{slug}-{uuid.uuid4().hex[:6]}"
+    org_response = supabase_request(
+        "POST",
+        "/rest/v1/organizations",
+        headers={"Prefer": "return=representation"},
+        json={"id": org_id, "name": payload.name, "slug": slug},
+    )
+    created_org = require_ok(org_response)[0]
+    supabase_request(
+        "POST",
+        "/rest/v1/organization_members",
+        headers={"Prefer": "return=minimal"},
+        json={"id": member_id, "organization_id": org_id, "user_id": user["id"], "role": "admin"},
+    ).raise_for_status()
+    supabase_request(
+        "POST",
+        "/rest/v1/brand_settings",
+        headers={"Prefer": "return=minimal"},
+        json={"id": brand_id, "organization_id": org_id},
+    ).raise_for_status()
 
-        cur.execute(
-            "INSERT INTO organizations (id, name, slug, logo_url, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)",
-            (org_id, payload.name, slug, now, now),
-        )
-        cur.execute(
-            "INSERT INTO organization_members (id, organization_id, user_id, role, created_at) VALUES (?, ?, ?, 'admin', ?)",
-            (member_id, org_id, user["id"], now),
-        )
-        cur.execute(
-            """
-            INSERT INTO brand_settings (
-              id, organization_id, primary_color, secondary_color, accent_color, font_heading, font_body, created_at, updated_at
-            ) VALUES (?, ?, '#3B82F6', '#8B5CF6', '#F59E0B', 'Inter', 'Inter', ?, ?)
-            """,
-            (brand_id, org_id, now, now),
-        )
-
-    return {"id": org_id, "name": payload.name, "slug": slug, "logo_url": None, "role": "admin"}
+    return {**created_org, "role": "admin"}
 
 
 @app.get("/api/dashboard/stats")
 def dashboard_stats(organization_id: str, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, int]:
     get_membership(user["id"], organization_id)
-    with get_cursor() as cur:
-        posts = cur.execute("SELECT COUNT(*) AS total FROM posts WHERE organization_id = ?", (organization_id,)).fetchone()
-        templates = cur.execute(
-            "SELECT COUNT(*) AS total FROM templates WHERE organization_id = ? OR is_public = 1",
-            (organization_id,),
-        ).fetchone()
-    return {"posts": posts["total"], "templates": templates["total"]}
+    posts_response = supabase_request(
+        "HEAD",
+        "/rest/v1/posts",
+        headers={"Prefer": "count=exact"},
+        params={"select": "id", "organization_id": f"eq.{organization_id}"},
+    )
+    templates_response = supabase_request(
+        "HEAD",
+        "/rest/v1/templates",
+        headers={"Prefer": "count=exact"},
+        params={"select": "id", "or": f"(organization_id.eq.{organization_id},is_public.eq.true)"},
+    )
+    return {"posts": content_range_total(posts_response), "templates": content_range_total(templates_response)}
 
 
 @app.get("/api/brand/{organization_id}")
 def get_brand(organization_id: str, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     get_membership(user["id"], organization_id)
-    with get_cursor() as cur:
-        row = cur.execute("SELECT * FROM brand_settings WHERE organization_id = ?", (organization_id,)).fetchone()
-    if not row:
+    response = supabase_request(
+        "GET",
+        "/rest/v1/brand_settings",
+        params={"select": "*", "organization_id": f"eq.{organization_id}", "limit": "1"},
+    )
+    rows = require_ok(response)
+    if not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand settings not found")
-    return row
+    return rows[0]
 
 
 @app.put("/api/brand/{organization_id}")
@@ -250,132 +276,127 @@ def update_brand(organization_id: str, payload: BrandPayload, user: dict[str, An
     if membership["role"] != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
 
-    now = utcnow()
-    with get_cursor(commit=True) as cur:
-        cur.execute(
-            """
-            UPDATE brand_settings
-            SET primary_color = ?, secondary_color = ?, accent_color = ?, font_heading = ?, font_body = ?, updated_at = ?
-            WHERE organization_id = ?
-            """,
-            (
-                payload.primary_color,
-                payload.secondary_color,
-                payload.accent_color,
-                payload.font_heading,
-                payload.font_body,
-                now,
-                organization_id,
-            ),
-        )
-        row = cur.execute("SELECT * FROM brand_settings WHERE organization_id = ?", (organization_id,)).fetchone()
-    return row
+    response = supabase_request(
+        "PATCH",
+        "/rest/v1/brand_settings",
+        headers={"Prefer": "return=representation"},
+        params={"organization_id": f"eq.{organization_id}"},
+        json=payload.model_dump(),
+    )
+    rows = require_ok(response)
+    return rows[0]
 
 
 @app.get("/api/team/{organization_id}")
 def list_team(organization_id: str, user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
     get_membership(user["id"], organization_id)
-    with get_cursor() as cur:
-        rows = cur.execute(
-            """
-            SELECT om.id, om.role, om.user_id, u.full_name
-            FROM organization_members om
-            JOIN users u ON u.id = om.user_id
-            WHERE om.organization_id = ?
-            ORDER BY om.created_at ASC
-            """,
-            (organization_id,),
-        ).fetchall()
-    return rows
+    members_response = supabase_request(
+        "GET",
+        "/rest/v1/organization_members",
+        params={"select": "id,role,user_id", "organization_id": f"eq.{organization_id}", "order": "created_at.asc"},
+    )
+    members = require_ok(members_response)
+    user_ids = [member["user_id"] for member in members]
+    if not user_ids:
+        return []
+
+    profiles_response = supabase_request(
+        "GET",
+        "/rest/v1/profiles",
+        params={"select": "user_id,full_name", "user_id": f"in.({','.join(user_ids)})"},
+    )
+    profiles = require_ok(profiles_response)
+    profile_by_user_id = {profile["user_id"]: profile for profile in profiles}
+
+    return [{**member, "full_name": profile_by_user_id.get(member["user_id"], {}).get("full_name")} for member in members]
 
 
 @app.get("/api/posts")
 def list_posts(organization_id: str, user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
     get_membership(user["id"], organization_id)
-    with get_cursor() as cur:
-        rows = cur.execute(
-            """
-            SELECT id, title, format, created_at
-            FROM posts
-            WHERE organization_id = ?
-            ORDER BY created_at DESC
-            """,
-            (organization_id,),
-        ).fetchall()
-    return rows
+    response = supabase_request(
+        "GET",
+        "/rest/v1/posts",
+        params={
+            "select": "id,title,format,created_at",
+            "organization_id": f"eq.{organization_id}",
+            "order": "created_at.desc",
+        },
+    )
+    return require_ok(response)
 
 
 @app.post("/api/posts", status_code=status.HTTP_201_CREATED)
 def create_post(payload: CreatePostPayload, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     get_membership(user["id"], payload.organization_id)
-    now = utcnow()
     post_id = str(uuid.uuid4())
+    post_response = supabase_request(
+        "POST",
+        "/rest/v1/posts",
+        headers={"Prefer": "return=representation"},
+        json={
+            "id": post_id,
+            "organization_id": payload.organization_id,
+            "title": payload.title,
+            "format": payload.format,
+            "width": payload.width,
+            "height": payload.height,
+            "created_by": user["id"],
+        },
+    )
+    created = require_ok(post_response)[0]
 
-    with get_cursor(commit=True) as cur:
-        cur.execute(
-            """
-            INSERT INTO posts (id, organization_id, title, format, width, height, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                post_id,
-                payload.organization_id,
-                payload.title,
-                payload.format,
-                payload.width,
-                payload.height,
-                user["id"],
-                now,
-                now,
-            ),
-        )
-
-        for index, layer in enumerate(payload.layers):
-            cur.execute(
-                """
-                INSERT INTO post_layers (id, post_id, type, z_index, properties, visible, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    post_id,
-                    layer.type,
-                    index,
-                    __import__("json").dumps(layer.properties),
-                    1 if layer.visible else 0,
-                    now,
-                    now,
-                ),
+    layer_rows = [
+        {
+            "id": str(uuid.uuid4()),
+            "post_id": post_id,
+            "type": layer.type,
+            "z_index": index,
+            "properties": layer.properties,
+            "visible": layer.visible,
+        }
+        for index, layer in enumerate(payload.layers)
+    ]
+    if layer_rows:
+        require_ok(
+            supabase_request(
+                "POST",
+                "/rest/v1/post_layers",
+                headers={"Prefer": "return=minimal"},
+                json=layer_rows,
             )
-
-        created = cur.execute("SELECT id, title, format, created_at FROM posts WHERE id = ?", (post_id,)).fetchone()
+        )
     return created
 
 
 @app.delete("/api/posts/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_post(post_id: str, user: dict[str, Any] = Depends(get_current_user)) -> None:
-    with get_cursor(commit=True) as cur:
-        post = cur.execute("SELECT id, organization_id FROM posts WHERE id = ?", (post_id,)).fetchone()
-        if not post:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
-        get_membership(user["id"], post["organization_id"])
-        cur.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+    post_response = supabase_request(
+        "GET",
+        "/rest/v1/posts",
+        params={"select": "id,organization_id", "id": f"eq.{post_id}", "limit": "1"},
+    )
+    posts = require_ok(post_response)
+    if not posts:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Post not found")
+    get_membership(user["id"], posts[0]["organization_id"])
+    delete_response = supabase_request("DELETE", "/rest/v1/posts", params={"id": f"eq.{post_id}"})
+    require_ok(delete_response)
 
 
 @app.get("/api/templates")
 def list_templates(organization_id: str, user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
     get_membership(user["id"], organization_id)
-    with get_cursor() as cur:
-        rows = cur.execute(
-            """
-            SELECT id, name, category, format, is_public
-            FROM templates
-            WHERE organization_id = ? OR is_public = 1
-            ORDER BY created_at DESC
-            """,
-            (organization_id,),
-        ).fetchall()
-    return [{**row, "is_public": bool(row["is_public"])} for row in rows]
+    response = supabase_request(
+        "GET",
+        "/rest/v1/templates",
+        params={
+            "select": "id,name,category,format,is_public",
+            "or": f"(organization_id.eq.{organization_id},is_public.eq.true)",
+            "order": "created_at.desc",
+        },
+    )
+    return require_ok(response)
 
 
 @app.post("/api/ai/generate-background")
@@ -396,5 +417,5 @@ def generate_background(payload: BackgroundPayload, user: dict[str, Any] = Depen
       <circle cx='{payload.width * 0.72}' cy='{payload.height * 0.78}' r='{max(payload.width, payload.height) * 0.18}' fill='rgba(0,0,0,0.14)' />
     </svg>
     """.strip()
-    image_url = "data:image/svg+xml;utf8," + __import__("urllib.parse").parse.quote(svg)
+    image_url = "data:image/svg+xml;utf8," + urllib.parse.quote(svg)
     return {"imageUrl": image_url, "provider": "local-gradient", "prompt": payload.prompt}
