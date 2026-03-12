@@ -99,6 +99,7 @@ def test_graph_single_post_happy_path() -> None:
 
     assert result["content_plan"]["slides"][0]["headline"]
     assert result["art_direction_plan"]["template_id"] == "template-1"
+    assert result["art_direction_plan"]["page_styles"]["cover"]["background_mode"] == "hero"
     assert result["composition_result"]["pages"][0]["nodes"]
     assert result["review_result"]["legibility_score"] > 0
     assert result["version_id"] == "9342bf7f-b93f-4e6b-9628-a7ec6f668a97"
@@ -144,5 +145,61 @@ def test_graph_carousel_triggers_generation_autofix_and_export() -> None:
 
     assert result["generated_assets"]
     assert result["review_result"]["autofixes_applied"]
+    assert any(
+        node["id"].startswith("slide-index")
+        for page in result["composition_result"]["pages"]
+        for node in page["nodes"]
+    )
+    assert any(suggestion["category"] == "component" for suggestion in result["asset_suggestions"])
     assert result["export_job_id"] == "1d636211-3f26-4b8c-b0b7-71dd874df0f9"
     assert any(entry["step"] == "export_final_assets" for entry in result["execution_log"])
+
+
+def test_graph_reuses_existing_background_before_generating() -> None:
+    service = _service()
+    result = service.graph.invoke(
+        {
+            "project_id": "84515b56-1c16-4b5a-9d3e-2efe30cbe1a6",
+            "tenant_id": "078e523c-be43-45de-b8d8-4b0fb005459a",
+            "brand_id": None,
+            "ai_job_id": "d9a6fd30-ccfc-4777-9dda-d719f28f374d",
+            "project_context": {
+                "channel": "instagram",
+                "format_type": "instagram_post_square",
+                "piece_type": "single_post",
+                "page_count": 1,
+                "dimensions": {"width": 1080, "height": 1080},
+                "objective": "awareness",
+                "audience": "design leads",
+                "language": "pt-BR",
+                "cta": "Conheça o sistema",
+                "user_prompt": "Apresente o sistema visual da plataforma com clareza e sofisticação.",
+            },
+            "brand_context": {
+                "color_tokens": {
+                    "primary": ["#0F172A"],
+                    "secondary": ["#E11D48"],
+                    "neutral": ["#F8FAFC"],
+                },
+                "typography": {"heading_family": "Space Grotesk", "body_family": "DM Sans"},
+                "visual_style_keywords": ["editorial", "bold"],
+            },
+            "asset_context": {
+                "assets": [
+                    {
+                        "id": "asset-bg-1",
+                        "category": "background",
+                        "is_decorative": True,
+                        "preview_url": "https://example.com/hero-bg.png",
+                    }
+                ]
+            },
+            "template_context": {"templates": []},
+            "generated_assets": [],
+            "execution_log": [],
+            "asset_suggestions": [],
+        }
+    )
+
+    assert result["art_direction_plan"]["asset_refs"] == ["asset-bg-1"]
+    assert result["generated_assets"] == []

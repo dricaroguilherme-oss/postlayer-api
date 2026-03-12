@@ -199,7 +199,7 @@ class LangGraphOrchestrationService:
         return "persist_version"
 
     def apply_autofixes(self, state: WorkflowState) -> WorkflowState:
-        return apply_autofixes(state, self.text_provider)
+        return apply_autofixes(state, self.text_provider, self.review_rules)
 
     def persist_version(self, state: WorkflowState) -> WorkflowState:
         project = self.session.get(CreativeProject, uuid.UUID(state["project_id"]))
